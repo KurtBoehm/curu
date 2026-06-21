@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "curu"
+description = "Various programmer utilities"
+dynamic = ["version"]
+readme = "ReadMe.md"
+requires-python = ">=3.12"
+license = "MPL-2.0"
+license-files = ["License"]
+authors = [{ name = "Kurt Böhm", email = "kurbo96@gmail.com" }]
+keywords = [
+  "c++",
+  "command-line",
+  "cli",
+  "git",
+  "development",
+  "icon",
+  "image",
+  "pretty-print",
+  "text-processing",
+  "utilities",
+]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development",
+  "Topic :: Software Development :: Build Tools",
+  "Topic :: Software Development :: Code Generators",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Topic :: Software Development :: Version Control :: Git",
+  "Topic :: Text Processing",
+  "Topic :: Text Processing :: Filters",
+  "Topic :: Utilities",
+]
+dependencies = ["colorama", "GitPython", "pydantic", "pyperclip", "pyvips"]
+
+[project.optional-dependencies]
+binary = ["pyvips[binary]"]
+
+[project.urls]
+Homepage = "https://github.com/KurtBoehm/curu"
+Repository = "https://github.com/KurtBoehm/curu"
+Issues = "https://github.com/KurtBoehm/curu/issues"
+
+[project.scripts]
+check-git = "curu.check_git:run"
+icon-scale = "curu.icon_scale:run"
+parse-nested = "curu.parse_nested:run"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.dynamic]
+version = { attr = "curu.__version__" }
