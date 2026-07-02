@@ -176,12 +176,17 @@ def demangle(txt: str):
     def impl(s: str) -> str:
         if not s.startswith("_Z"):
             return s
-        try:
-            ret = _run(["llvm-cxxfilt", s], check=True, stdout=PIPE, encoding="utf-8")
-            return ret.stdout if ret.returncode == 0 else s
-        except FileNotFoundError as err:
-            print(err)
-            return s
+
+        # Try standard path first, then Homebrew fallback
+        candidates = ["llvm-cxxfilt", "/opt/homebrew/opt/llvm/bin/llvm-cxxfilt"]
+
+        for cmd in candidates:
+            try:
+                _run([cmd, s], check=True, stdout=PIPE, encoding="utf-8")
+            except FileNotFoundError:
+                continue
+
+        return s
 
     return " ".join(impl(s) for s in txt.split())
 
