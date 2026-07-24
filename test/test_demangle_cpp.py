@@ -366,8 +366,7 @@ class TestExplicitObjectParameter:
 
     def test_const_reference_object_parameter(self) -> None:
         assert (
-            demangle_strict("_ZNH1S10byconstrefERKS_")
-            == "S::byconstref(this S const&)"
+            demangle_strict("_ZNH1S10byconstrefERKS_") == "S::byconstref(this S const&)"
         )
 
     def test_by_value_object_parameter(self) -> None:
@@ -377,9 +376,7 @@ class TestExplicitObjectParameter:
         assert demangle_strict("_ZNH1S6byrrefEOS_") == "S::byrref(this S&&)"
 
     def test_templated_object_parameter(self) -> None:
-        assert (
-            demangle_strict("_ZNH1S4tmplIRS_EEvOT_") == "void S::tmpl<S&>(this S&)"
-        )
+        assert demangle_strict("_ZNH1S4tmplIRS_EEvOT_") == "void S::tmpl<S&>(this S&)"
 
     def test_h_marker_no_longer_rejects_deeply_nested_real_world_symbol(self) -> None:
         """
@@ -406,8 +403,8 @@ class TestExplicitObjectParameter:
         with pytest.raises(DemangleError) as exc_info:
             demangle_strict(symbol)
         message = str(exc_info.value)
-        assert "unknown operator or unqualified-name" not in message
-        assert "substitution" in message
+        assert "Unknown operator or unqualified-name" not in message
+        assert "Substitution" in message
 
 
 # --------------------------------------------------------------------------------------
@@ -442,9 +439,7 @@ class TestTemplateParamDeclaratorPropagation:
         ``OT_`` where ``T_`` has been deduced to an lvalue reference (``S&``) must
         collapse to ``S&``, not naively concatenate into ``S&&&``.
         """
-        assert (
-            demangle_strict("_ZNH1S4tmplIRS_EEvOT_") == "void S::tmpl<S&>(this S&)"
-        )
+        assert demangle_strict("_ZNH1S4tmplIRS_EEvOT_") == "void S::tmpl<S&>(this S&)"
 
 
 # --------------------------------------------------------------------------------------
@@ -493,7 +488,9 @@ class TestSubstitutionTableNumbering:
             "(float, linalg::DenseVector&)"
         )
 
-    def test_recursive_opexpr_argument_via_explicit_object_member_function(self) -> None:
+    def test_recursive_opexpr_argument_via_explicit_object_member_function(
+        self,
+    ) -> None:
         """
         A member function taking an explicit object parameter (``this auto&&``, the
         ``H`` marker), on a class whose own template argument is itself another
@@ -519,7 +516,9 @@ class TestSubstitutionTableNumbering:
             "linalg::OpExpr<float, int, linalg::DenseVector&>>>&, linalg::OwnIndexTag)"
         )
 
-    def test_constrained_template_argument_renders_as_the_underlying_argument(self) -> None:
+    def test_constrained_template_argument_renders_as_the_underlying_argument(
+        self,
+    ) -> None:
         """
         ``Tk<concept-name><template-arg>`` (a "constrained template argument", the
         newer Itanium ABI extension https://github.com/itanium-cxx-abi/cxx-abi/issues/24
@@ -676,9 +675,7 @@ class TestPlaceholderMode:
         symbol = "_ZN3foo1fEPiS0_RK1AS2_"
         assert demangle_strict(symbol) == "foo::f(int*, int*, A const&, A const)"
         result = demangle_strict(symbol, placeholders=True)
-        assert result == (
-            "foo::f(int*, $0, A const&, $1) [$0 = int*, $1 = A const]"
-        )
+        assert result == "foo::f(int*, $0, A const&, $1) [$0 = int*, $1 = A const]"
 
     def test_min_placeholder_length_inlines_short_substitutions(self) -> None:
         """
@@ -687,12 +684,22 @@ class TestPlaceholderMode:
         """
         symbol = "_ZN3foo1fEPiS0_"
         rendered_length = len("int*")
-        assert demangle_strict(
-            symbol, placeholders=True, min_placeholder_length=rendered_length
-        ) == "foo::f(int*, $0) [$0 = int*]"
-        assert demangle_strict(
-            symbol, placeholders=True, min_placeholder_length=rendered_length + 1
-        ) == "foo::f(int*, int*)"
+        assert (
+            demangle_strict(
+                symbol,
+                placeholders=True,
+                min_placeholder_length=rendered_length,
+            )
+            == "foo::f(int*, $0) [$0 = int*]"
+        )
+        assert (
+            demangle_strict(
+                symbol,
+                placeholders=True,
+                min_placeholder_length=rendered_length + 1,
+            )
+            == "foo::f(int*, int*)"
+        )
 
     def test_min_placeholder_length_still_placeholderizes_long_substitutions(
         self,
@@ -841,7 +848,7 @@ class TestErrorHandling:
             demangle_strict("_ZN3foo")
 
     def test_unknown_operator(self) -> None:
-        with pytest.raises(DemangleError, match="unknown operator"):
+        with pytest.raises(DemangleError, match="Unknown operator"):
             demangle_strict("_Zzzfoo")
 
     def test_substitution_out_of_range(self) -> None:
