@@ -755,6 +755,12 @@ SPECIAL: dict[str, str] = {
     "TA": "template parameter object for ",
 }
 
+# GNU c++filt uses different wording than LLVM for these two labels.
+SPECIAL_GCC: dict[str, str] = {
+    "TH": "TLS init function for ",
+    "TW": "TLS wrapper function for ",
+}
+
 
 ########################################################################################
 # The parser
@@ -770,6 +776,7 @@ class Demangler:
         style: Style = "gcc",
         placeholders: bool = False,
         min_placeholder_length: int = 0,
+        apple_clang_21_workarounds: bool = False,
     ) -> None:
         self.s: str = text
         self.i: int = 0
@@ -787,6 +794,7 @@ class Demangler:
         self.placeholder_labels: dict[int, str] = {}
         self.placeholder_order: list[tuple[str, Node]] = []
         self.inlined_subs: set[int] = set()
+        self.apple_clang_21_workarounds: bool = apple_clang_21_workarounds
 
     def _render(self, node: Node) -> str:
         """
@@ -1123,7 +1131,10 @@ class Demangler:
         """
         c = self.peek()
         if c.isdigit():
-            node = Lit(self.parse_source_name())
+            source_name = self.parse_source_name()
+            if source_name.startswith("_GLOBAL__N_"):
+                source_name = "(anonymous namespace)"
+            node = Lit(source_name)
         elif c == "L":
             self.advance()
             node = Lit(self.parse_source_name())
@@ -1261,7 +1272,19 @@ class Demangler:
             self.expect("_")
             idx = val + 1
         if idx >= len(self.subs):
-            self.fail(f"substitution S{idx} out of range (have {len(self.subs)})")
+            if self.apple_clang_21_workarounds and self.subs:
+                # Apple Clang 21 has a mangling bug (not present in upstream/mainline
+                # LLVM Clang, which additionally emits a "Tk" marker not present here)
+                # where certain lambda closures nested inside recursive class-template
+                # arguments are mangled with a substitution index exactly one past the
+                # end of a spec-compliant substitution table built from the rest of the
+                # string. Rather than fail outright, fall back to the most recently
+                # registered substitution -- typically the closest available referent
+                # for these off-by-one references, and always better than aborting the
+                # whole demangle over a single bad backreference.
+                idx = len(self.subs) - 1
+            else:
+                self.fail(f"substitution S{idx} out of range (have {len(self.subs)})")
         node = self.subs[idx]
         if self.use_placeholders:
             return self.placeholder_for(idx, node)
@@ -1827,16 +1850,21 @@ class Demangler:
         two = self.s[self.i : self.i + 2]
         if two in SPECIAL:
             self.advance(2)
+            label = SPECIAL_GCC.get(two, SPECIAL[two]) if self.style == "gcc" else SPECIAL[two]
             if two in ("TV", "TT", "TI", "TS"):
-                return Lit(f"{SPECIAL[two]}{self.parse_type()}")
-            return Lit(f"{SPECIAL[two]}{self.parse_encoding()}")
-        if c == "T" and self.peek(1) in "hvc":
-            kind = self.peek(1)
+                return Lit(f"{label}{self.parse_type()}")
+            return Lit(f"{label}{self.parse_encoding()}")
+        if c == "T" and self.peek(1) == "c":
             self.advance(2)
             self.parse_call_offset()
-            if kind == "c":
-                self.parse_call_offset()
-            return Lit(f"virtual thunk to {self.parse_encoding()}")
+            self.parse_call_offset()
+            return Lit(f"covariant return thunk to {self.parse_encoding()}")
+        if c == "T" and self.peek(1) in "hv":
+            kind = self.peek(1)
+            self.advance(1)
+            self.parse_call_offset()
+            label = "non-virtual" if kind == "h" else "virtual"
+            return Lit(f"{label} thunk to {self.parse_encoding()}")
 
         saved_depth = len(self.tparams)
         name = self.parse_name(tag=True)
@@ -1881,12 +1909,15 @@ class Demangler:
         """
         Demangle the full input string.
 
+        Any input remaining after a complete ``<encoding>`` is left unconsumed
+        (see ``self.i``) rather than rejected here, since it may be a legitimate
+        clone suffix (for example ``.constprop.0``) rather than garbage; the
+        caller decides how to treat it.
+
         :return: Demangled text.
         """
         self.expect("_Z")
         node = self.parse_encoding()
-        if not self.at_end():
-            self.fail("trailing characters")
         text = self._render(node)
         if self.placeholder_order:
             legend = ", ".join(
@@ -1901,7 +1932,8 @@ class Demangler:
 # Public API.
 ########################################################################################
 
-_SUFFIX_RE = re.compile(r"^(_+Z[^.$]*)([.$].*)?$")
+_PREFIX_RE = re.compile(r"^_+Z")
+_CLONE_SUFFIX_RE = re.compile(r"[.$][A-Za-z0-9_.$]*")
 _SYMBOL_RE = re.compile(r"_+Z[A-Za-z0-9_$.]+")
 
 
@@ -1910,6 +1942,7 @@ def demangle_strict(
     style: Style = "gcc",
     placeholders: bool = False,
     min_placeholder_length: int = 0,
+    apple_clang_21_workarounds: bool = False,
 ) -> str:
     """
     Demangle ``name`` or raise ``DemangleError``.
@@ -1926,23 +1959,35 @@ def demangle_strict(
         rendered text before it is placeholderized; substitutions rendering shorter than
         this are always inlined instead. Only relevant when ``placeholders`` is
         ``True``.
+    :param apple_clang_21_workarounds: When ``True``, work around a known Apple Clang 21
+        mangling bug where certain lambda closures nested inside recursive
+        class-template arguments are mangled with a substitution index one past the end
+        of a spec-compliant substitution table. Instead of raising ``DemangleError`` on
+        such an out-of-range substitution reference, falls back to the most recently
+        registered substitution, producing a best-effort (not guaranteed fully correct)
+        result rather than failing outright. Has no effect on correctly-mangled names.
     :return: Demangled name.
     :raises ValueError: If ``style`` is not recognized.
     :raises DemangleError: If the input is not a valid mangled name.
     """
-    m = _SUFFIX_RE.match(name.strip())
+    stripped = name.strip()
+    m = _PREFIX_RE.match(stripped)
     if not m:
         raise DemangleError(f"not an Itanium mangled name: {name!r}")
-    core, suffix = m.group(1), m.group(2) or ""
-    core = core[core.index("_Z") :]
-    result = Demangler(
+    core = stripped[m.end() - 2 :]
+    demangler = Demangler(
         core,
         style=style,
         placeholders=placeholders,
         min_placeholder_length=min_placeholder_length,
-    ).run()
-    if suffix:
-        result += f" [clone {suffix}]"
+        apple_clang_21_workarounds=apple_clang_21_workarounds,
+    )
+    result = demangler.run()
+    remainder = core[demangler.i :]
+    if remainder and not _CLONE_SUFFIX_RE.fullmatch(remainder):
+        demangler.fail("trailing characters")
+    if remainder:
+        result += f" [clone {remainder}]"
     return result
 
 
@@ -1951,6 +1996,7 @@ def demangle(
     style: Style = "gcc",
     placeholders: bool = False,
     min_placeholder_length: int = 0,
+    apple_clang_21_workarounds: bool = False,
 ) -> str:
     """
     Demangle ``name`` or return it unchanged on failure.
@@ -1959,10 +2005,13 @@ def demangle(
     :param style: Output style, either ``"gcc"`` or ``"llvm"``.
     :param placeholders: See :func:`demangle_strict`.
     :param min_placeholder_length: See :func:`demangle_strict`.
+    :param apple_clang_21_workarounds: See :func:`demangle_strict`.
     :return: Demangled name or original input.
     """
     try:
-        return demangle_strict(name, style, placeholders, min_placeholder_length)
+        return demangle_strict(
+            name, style, placeholders, min_placeholder_length, apple_clang_21_workarounds
+        )
     except (DemangleError, RecursionError):
         return name
 
@@ -1972,6 +2021,7 @@ def demangle_text(
     style: Style = "gcc",
     placeholders: bool = False,
     min_placeholder_length: int = 0,
+    apple_clang_21_workarounds: bool = False,
 ) -> str:
     """
     Replace every mangled name in ``text`` with its demangled form.
@@ -1980,11 +2030,16 @@ def demangle_text(
     :param style: Output style, either ``"gcc"`` or ``"llvm"``.
     :param placeholders: See :func:`demangle_strict`.
     :param min_placeholder_length: See :func:`demangle_strict`.
+    :param apple_clang_21_workarounds: See :func:`demangle_strict`.
     :return: Text with demangled symbols.
     """
     return _SYMBOL_RE.sub(
         lambda match: demangle(
-            match.group(0), style, placeholders, min_placeholder_length
+            match.group(0),
+            style,
+            placeholders,
+            min_placeholder_length,
+            apple_clang_21_workarounds,
         ),
         text,
     )
@@ -2099,6 +2154,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "reused substitution)."
         ),
     )
+    parser.add_argument(
+        "--apple-clang-21-workarounds",
+        action="store_true",
+        help=(
+            "Work around a known Apple Clang 21 mangling bug where certain lambda "
+            "closures nested inside recursive class-template arguments are mangled "
+            "with an out-of-range substitution reference. Falls back to the most "
+            "recently registered substitution instead of failing, producing a "
+            "best-effort (not guaranteed fully correct) result. Has no effect on "
+            "correctly-mangled names."
+        ),
+    )
     return parser
 
 
@@ -2139,6 +2206,7 @@ def run(argv: Iterable[str] | None = None) -> int:
                         args.style,
                         args.placeholders,
                         args.min_placeholder_length,
+                        args.apple_clang_21_workarounds,
                     )
                 )
             elif args.strict:
@@ -2156,6 +2224,7 @@ def run(argv: Iterable[str] | None = None) -> int:
                         args.style,
                         args.placeholders,
                         args.min_placeholder_length,
+                        args.apple_clang_21_workarounds,
                     )
                 )
     return status
