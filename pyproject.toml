@@ -54,6 +54,7 @@ Issues = "https://github.com/KurtBoehm/curu/issues"
 
 [project.scripts]
 check-git = "curu.check_git:run"
+demangle-cpp = "curu.demangle_cpp:run"
 icon-scale = "curu.icon_scale:run"
 parse-nested = "curu.parse_nested:run"
 
