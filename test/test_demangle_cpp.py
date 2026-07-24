@@ -40,6 +40,14 @@ SYMBOLS: tuple[str, ...] = (
     "_ZTV3foo",
     "_ZTI3foo",
     "_Z1fIiEvT_S0_",
+    "_ZNH1S3fooERS_i",
+    "_ZNH1S10byconstrefERKS_",
+    "_ZNH1S4tmplIRS_EEvOT_",
+    "_ZNH1S5byvalES_",
+    "_ZNH1S6byrrefEOS_",
+    "_Z1fIiEvPT_",
+    "_ZN2ns4makeIdJidEEEDaDpOT0_",
+    "_ZN2ns4makeIdiEENS_4ExprIT_vJN4thes5AllocIS2_EEEEEv",
 )
 
 
@@ -264,6 +272,169 @@ class TestAgainstSystemDemanglers(unittest.TestCase):
                 self.assertEqual(actual, expected)
 
 
+class TestExplicitObjectParameter(unittest.TestCase):
+    """
+    Exercise the Itanium ABI extension for explicit object ('deducing this')
+    parameters: an ``H`` right after the nested-name's opening ``N`` marks the first
+    parameter as the object parameter, which is rendered with a leading ``this``.
+    """
+
+    def test_lvalue_reference_object_parameter(self) -> None:
+        self.assertEqual(
+            demangle_strict("_ZNH1S3fooERS_i"), "S::foo(this S&, int)"
+        )
+
+    def test_const_reference_object_parameter(self) -> None:
+        self.assertEqual(
+            demangle_strict("_ZNH1S10byconstrefERKS_"),
+            "S::byconstref(this S const&)",
+        )
+
+    def test_by_value_object_parameter(self) -> None:
+        self.assertEqual(demangle_strict("_ZNH1S5byvalES_"), "S::byval(this S)")
+
+    def test_rvalue_reference_object_parameter(self) -> None:
+        self.assertEqual(
+            demangle_strict("_ZNH1S6byrrefEOS_"), "S::byrref(this S&&)"
+        )
+
+    def test_templated_object_parameter(self) -> None:
+        self.assertEqual(
+            demangle_strict("_ZNH1S4tmplIRS_EEvOT_"), "void S::tmpl<S&>(this S&)"
+        )
+
+
+class TestTemplateParamDeclaratorPropagation(unittest.TestCase):
+    """
+    Regression tests for a bug where a declarator wrapped around a template-parameter
+    reference (``T_``, ``T0_``, ...) was silently dropped: ``ParamRef.render`` ignored
+    its ``inner`` argument instead of forwarding it to the resolved target, so e.g.
+    ``PT_`` (pointer to ``T_``) rendered as the bare parameter type with the ``*``
+    missing entirely.
+    """
+
+    def test_pointer_to_template_param(self) -> None:
+        """``PT_`` must keep its ``*``, not drop it like the resolved type's own."""
+        self.assertEqual(demangle_strict("_Z1fIiEvPT_"), "void f<int>(int*)")
+
+    def test_pack_expansion_of_rvalue_reference_to_pack(self) -> None:
+        """
+        ``Dp OT0_`` (pack expansion of ``Args&&...``) must apply the ``&&`` to each
+        pack element individually, not to the comma-joined text as a whole.
+        """
+        self.assertEqual(
+            demangle_strict("_ZN2ns4makeIdJidEEEDaDpOT0_"),
+            "auto ns::make<double, int, double>(int&&, double&&)",
+        )
+
+    def test_reference_collapsing_on_forwarding_reference(self) -> None:
+        """
+        ``OT_`` where ``T_`` has been deduced to an lvalue reference (``S&``) must
+        collapse to ``S&``, not naively concatenate into ``S&&&``.
+        """
+        self.assertEqual(
+            demangle_strict("_ZNH1S4tmplIRS_EEvOT_"), "void S::tmpl<S&>(this S&)"
+        )
+
+
+class TestSubstitutionTableNumbering(unittest.TestCase):
+    """
+    Regression test for a bug where a bare substitution reference (``S_``, ``S0_``,
+    ...) used as the *first* component of a nested-name was incorrectly re-added to
+    the substitution table as if it were newly parsed content. Per the Itanium ABI, a
+    production that resolves via the ``<substitution>`` alternative never itself gets
+    a new table entry -- only a *combination* built on top of it does. The erroneous
+    re-add shifted every later ``Sn_`` index by one, corrupting unrelated back
+    references deep in the symbol (observed as a nonsensical type, e.g. a class
+    template's own name, appearing where an unrelated template argument belonged).
+    """
+
+    def test_bare_substitution_reused_as_nested_name_prefix(self) -> None:
+        symbol = "_ZN2ns4makeIdiEENS_4ExprIT_vJN4thes5AllocIS2_EEEEEv"
+        self.assertEqual(
+            demangle_strict(symbol, style="llvm"),
+            "ns::Expr<double, void, thes::Alloc<double>> ns::make<double, int>()",
+        )
+
+    def test_generic_lambda_closure_type_referenced_via_local_name(self) -> None:
+        """
+        A class template argument that names a generic lambda's closure type via
+        ``Z<encoding>E<unnamed-type-name>`` local-name syntax, where the lambda's own
+        (generic, deduced) parameter type is itself expressed as a substitution
+        back-reference into the *outer* scope (``Ul S..._ E_``). This is the exact
+        construct from https://github.com/KurtBoehm/lineal's
+        ``lineal::scale``/``OpExpr`` machinery (component-wise/vector-expression.hpp)
+        that originally produced garbled substitution output. Verified against this
+        machine's GCC 16 (``g++-16``), whose mangling of the identical construct is
+        independently confirmed correct by both a fresh LLVM ``llvm-cxxfilt`` and a
+        fresh GNU ``c++filt``.
+        """
+        symbol = (
+            "_ZN6HolderIN6lineal6detail6OpExprIfZNS0_5scaleIfRNS0_11Dense"
+            "VectorEEEDaOT0_T_EUlS8_E_JS5_EEEiE14post_executionIRiiEEvS8_S6_"
+        )
+        self.assertEqual(
+            demangle_strict(symbol, style="llvm"),
+            "void Holder<lineal::detail::OpExpr<float, auto lineal::scale<float, "
+            "lineal::DenseVector&>(lineal::DenseVector&, float)::{lambda(float)#1}, "
+            "lineal::DenseVector&>, int>::post_execution<int&, int>"
+            "(float, lineal::DenseVector&)",
+        )
+
+    def test_recursive_opexpr_argument_via_explicit_object_member_function(self) -> None:
+        """
+        A member function taking an explicit object parameter (``this auto&&``, the
+        ``H`` marker), on a class whose own template argument is itself another
+        instantiation of the *same* class template (``OpExpr<Real, Op, Vecs...>``
+        nested inside ``OpExpr<Real, Op, Vecs...>``), reached through a pack
+        containing both a plain substitution back-reference and the nested
+        instantiation. Verified byte-for-byte against a fresh LLVM ``llvm-cxxfilt``
+        and fresh GNU ``c++filt`` on this machine (mangled by Apple Clang 21).
+        """
+        symbol = (
+            "_ZNH6lineal10AssignCwOpILb0ERNS_11DenseVectorENS_6OpExprIdiJS2_"
+            "NS3_IfiJS2_EEEEEEE14post_executionIRS6_NS_11OwnIndexTagEEEvOT_T0_"
+        )
+        self.assertEqual(
+            demangle_strict(symbol, style="llvm"),
+            "void lineal::AssignCwOp<false, lineal::DenseVector&, "
+            "lineal::OpExpr<double, int, lineal::DenseVector&, "
+            "lineal::OpExpr<float, int, lineal::DenseVector&>>>::post_execution<"
+            "lineal::AssignCwOp<false, lineal::DenseVector&, "
+            "lineal::OpExpr<double, int, lineal::DenseVector&, "
+            "lineal::OpExpr<float, int, lineal::DenseVector&>>>&, "
+            "lineal::OwnIndexTag>(this lineal::AssignCwOp<false, lineal::DenseVector&, "
+            "lineal::OpExpr<double, int, lineal::DenseVector&, "
+            "lineal::OpExpr<float, int, lineal::DenseVector&>>>&, lineal::OwnIndexTag)",
+        )
+
+    def test_constrained_template_argument_renders_as_the_underlying_argument(self) -> None:
+        """
+        ``Tk<concept-name><template-arg>`` (a "constrained template argument", the
+        newer Itanium ABI extension https://github.com/itanium-cxx-abi/cxx-abi/issues/24
+        for concept-constrained template/``auto`` parameters, e.g. ``NonGlobalIndexTag
+        auto tag``) must render as just the underlying argument, discarding the
+        concept name -- matching LLVM's own demangler, whose ``TemplateParamQualifiedArg``
+        node is documented "don't print Param [the concept], ... print Arg". Verified
+        against a fresh ``llvm-cxxfilt`` (this construct needs upstream/Homebrew LLVM
+        clang 22 to even emit ``Tk`` -- Apple Clang 21 does not).
+        """
+        symbol = (
+            "_ZNH6lineal10AssignCwOpILb0ERNS_11DenseVectorENS_6OpExprIdiJS2_"
+            "NS3_IfiJS2_EEEEEEE14post_executionIRS6_TkNS_17NonGlobalIndexTagE"
+            "NS_11OwnIndexTagEEEvOT_T0_"
+        )
+        result = demangle_strict(symbol, style="llvm")
+        self.assertNotIn("NonGlobalIndexTag auto", result)
+        self.assertIn(
+            "post_execution<lineal::AssignCwOp<false, lineal::DenseVector&, "
+            "lineal::OpExpr<double, int, lineal::DenseVector&, "
+            "lineal::OpExpr<float, int, lineal::DenseVector&>>>&, "
+            "lineal::OwnIndexTag>",
+            result,
+        )
+
+
 class TestPlaceholderMode(unittest.TestCase):
     """
     Exercise ``placeholders=True``, which renders substitution references as short
@@ -326,6 +497,41 @@ class TestPlaceholderMode(unittest.TestCase):
         self.assertEqual(
             demangle_strict(symbol, placeholders=True),
             demangle_strict(symbol),
+        )
+
+    def test_min_placeholder_length_inlines_short_substitutions(self) -> None:
+        """
+        A substitution shorter than ``min_placeholder_length`` stays inlined even
+        though it is reused, since a placeholder would not save any space.
+        """
+        symbol = "_ZN3foo1fEPiS0_"
+        rendered_length = len("int*")
+        self.assertEqual(
+            demangle_strict(
+                symbol, placeholders=True, min_placeholder_length=rendered_length
+            ),
+            "foo::f(int*, $0) [$0 = int*]",
+        )
+        self.assertEqual(
+            demangle_strict(
+                symbol, placeholders=True, min_placeholder_length=rendered_length + 1
+            ),
+            "foo::f(int*, int*)",
+        )
+
+    def test_min_placeholder_length_still_placeholderizes_long_substitutions(
+        self,
+    ) -> None:
+        """
+        A substitution at or above the threshold is placeholderized as usual, even
+        with a threshold that would inline a shorter one.
+        """
+        symbol = "_ZNSt6vectorIiSaIiEE9push_backES1_"
+        threshold = len("int*") + 1
+        self.assertEqual(
+            demangle_strict(symbol, placeholders=True, min_placeholder_length=threshold),
+            "std::vector<int, std::allocator<int> >::push_back($0) "
+            "[$0 = std::vector<int, std::allocator<int> >]",
         )
 
 

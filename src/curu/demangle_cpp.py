@@ -58,12 +58,23 @@ def _pre(tok: str, inner: str) -> str:
     """
     Prepend a declarator token to an existing declarator.
 
+    Reference-to-reference collapsing applies when both ``tok`` and the front of
+    ``inner`` are reference tokens (this happens when a template parameter that has
+    itself been deduced to a reference type is used in a ``T&`` or ``T&&`` context):
+    an lvalue reference wins if either side is one, otherwise the result is an rvalue
+    reference.
+
     :param tok: Declarator token.
     :param inner: Existing declarator text.
     :return: Combined declarator.
     """
     if not inner:
         return tok
+    if tok in ("&", "&&"):
+        if inner.startswith("&&"):
+            return ("&&" if tok == "&&" else "&") + inner[2:]
+        if inner.startswith("&"):
+            return "&" + inner[1:]
     if inner[0] in "*&(":
         return f"{tok}{inner}"
     return f"{tok} {inner}"
@@ -203,6 +214,11 @@ class Ptr(Node):
     def render(self, inner: str = "", style: Style = "gcc") -> str:
         return self.t.render(_pre("*", inner), style=style)
 
+    @override
+    def as_pack(self) -> list[Node] | None:
+        items = self.t.as_pack()
+        return None if items is None else [Ptr(item) for item in items]
+
 
 @final
 class LRef(Node):
@@ -215,6 +231,11 @@ class LRef(Node):
     def render(self, inner: str = "", style: Style = "gcc") -> str:
         return self.t.render(_pre("&", inner), style=style)
 
+    @override
+    def as_pack(self) -> list[Node] | None:
+        items = self.t.as_pack()
+        return None if items is None else [LRef(item) for item in items]
+
 
 @final
 class RRef(Node):
@@ -226,6 +247,11 @@ class RRef(Node):
     @override
     def render(self, inner: str = "", style: Style = "gcc") -> str:
         return self.t.render(_pre("&&", inner), style=style)
+
+    @override
+    def as_pack(self) -> list[Node] | None:
+        items = self.t.as_pack()
+        return None if items is None else [RRef(item) for item in items]
 
 
 @final
@@ -270,6 +296,11 @@ class Qual(Node):
                 f"{quals}{(' ' + inner) if inner else ''}", style=style
             )
         return _decl(f"{self.t.render(style=style)} {quals}", inner)
+
+    @override
+    def as_pack(self) -> list[Node] | None:
+        items = self.t.as_pack()
+        return None if items is None else [Qual(item, self.quals) for item in items]
 
 
 @final
@@ -405,7 +436,7 @@ class ParamRef(Node):
             return _decl(self.spelling, inner)
         self._busy = True
         try:
-            return target.render(style=style)
+            return target.render(inner, style=style)
         finally:
             self._busy = False
 
@@ -506,6 +537,18 @@ class Placeholder(Node):
     @override
     def as_pack(self) -> list[Node] | None:
         return self.target.as_pack()
+
+
+@final
+class ThisParam(Node):
+    """Explicit object ('deducing this') parameter, rendered with a leading ``this``."""
+
+    def __init__(self, t: Node) -> None:
+        self.t = t
+
+    @override
+    def render(self, inner: str = "", style: Style = "gcc") -> str:
+        return _decl(f"this {self.t.render(style=style)}", inner)
 
 
 @final
@@ -726,6 +769,7 @@ class Demangler:
         text: str,
         style: Style = "gcc",
         placeholders: bool = False,
+        min_placeholder_length: int = 0,
     ) -> None:
         self.s: str = text
         self.i: int = 0
@@ -734,12 +778,15 @@ class Demangler:
         self.tparams: list[list[Node]] = []
         self.func_cv: list[str] = []
         self.func_ref: str = ""
+        self.explicit_object: bool = False
         self.had_template_args: bool = False
         self.is_ctor_dtor: bool = False
         self.depth: int = 0
         self.use_placeholders: bool = placeholders
+        self.min_placeholder_length: int = min_placeholder_length
         self.placeholder_labels: dict[int, str] = {}
         self.placeholder_order: list[tuple[str, Node]] = []
+        self.inlined_subs: set[int] = set()
 
     def _render(self, node: Node) -> str:
         """
@@ -972,6 +1019,7 @@ class Demangler:
         :return: Parsed nested name.
         """
         self.expect("N")
+        explicit_object = self.consume_if("H")
         cv = self.parse_cv_qualifiers()
         ref = self.parse_ref_qualifier()
         node: Node | None = None
@@ -999,12 +1047,14 @@ class Demangler:
             if c == "M":
                 self.advance()
                 continue
+            bare_reference = False
             if c == "S" and self.peek(1) == "t":
                 self.advance(2)
                 comp: Node = Lit("std")
                 std_only = node is None
             elif c == "S":
                 comp = self.parse_substitution()
+                bare_reference = True
             elif c == "T":
                 comp = self.add_sub(self.parse_template_param())
             elif c == "D" and self.peek(1) in "tT":
@@ -1022,12 +1072,16 @@ class Demangler:
                 comp = self.parse_unqualified_name(node)
                 had_args = False
 
+            was_bare = node is None
             node = comp if node is None else Qualified(node, comp)
+            if bare_reference and was_bare:
+                registered = node
 
         if node is None:
             self.fail("empty nested-name")
         self.func_cv = cv
         self.func_ref = ref
+        self.explicit_object = explicit_object
         self.had_template_args = had_args
         return node
 
@@ -1145,7 +1199,7 @@ class Demangler:
         if self.consume_if("t"):
             digits = self.parse_digits()
             self.expect("_")
-            return UnnamedT(int(digits) + 1 if digits else 1)
+            return self.add_sub(UnnamedT(int(digits) + 1 if digits else 1))
         if self.consume_if("l"):
             saved: list[list[Node]] | None = None
             if self.peek() == "T" and self.peek(1) in "ytnpk":
@@ -1164,7 +1218,7 @@ class Demangler:
                 self.tparams = saved
             if len(params) == 1 and self._render(params[0]) == "void":
                 params = []
-            return Lambda(params, int(digits) + 1 if digits else 1)
+            return self.add_sub(Lambda(params, int(digits) + 1 if digits else 1))
         self.fail("unknown unnamed-type-name")
 
     def parse_template_param_decl(self) -> None:
@@ -1217,15 +1271,25 @@ class Demangler:
         """
         Return (creating if needed) the placeholder standing in for substitution ``idx``.
 
+        Substitutions whose rendered text is shorter than ``min_placeholder_length``
+        are always inlined instead, since a placeholder would not save any space.
+
         :param idx: Index into the substitution table.
         :param node: The node that substitution ``idx`` resolves to.
-        :return: A :class:`Placeholder` node labelling ``node``.
+        :return: A :class:`Placeholder` node labelling ``node``, or ``node`` itself when
+            it falls below the minimum placeholder length.
         """
         label = self.placeholder_labels.get(idx)
-        if label is None:
-            label = f"${len(self.placeholder_order)}"
-            self.placeholder_labels[idx] = label
-            self.placeholder_order.append((label, node))
+        if label is not None:
+            return Placeholder(label, node)
+        if idx in self.inlined_subs:
+            return node
+        if len(node.render(style=self.style)) < self.min_placeholder_length:
+            self.inlined_subs.add(idx)
+            return node
+        label = f"${len(self.placeholder_order)}"
+        self.placeholder_labels[idx] = label
+        self.placeholder_order.append((label, node))
         return Placeholder(label, node)
 
     def parse_template_param(self) -> Node:
@@ -1290,6 +1354,10 @@ class Demangler:
             return ArgPack(items)
         if c == "L":
             return self.parse_expr_primary()
+        if c == "T" and self.peek(1) == "k":
+            self.advance(2)
+            self.add_sub(self.parse_name())
+            return self.parse_template_arg()
         return self.parse_type()
 
     # ---- types -----------------------------------------------------------
@@ -1774,6 +1842,8 @@ class Demangler:
         name = self.parse_name(tag=True)
         cv, ref = self.func_cv, self.func_ref
         self.func_cv, self.func_ref = [], ""
+        explicit_object = self.explicit_object
+        self.explicit_object = False
         had_args, is_cd = self.had_template_args, self.is_ctor_dtor
 
         if self.at_end() or self.peek() in "E.":
@@ -1786,6 +1856,8 @@ class Demangler:
             params.append(self.parse_type())
         if len(params) == 1 and self._render(params[0]) == "void":
             params = []
+        if explicit_object and params:
+            params[0] = ThisParam(params[0])
         node = FuncNode(name, params, ret, cv, ref)
         del self.tparams[saved_depth:]
         return node
@@ -1837,6 +1909,7 @@ def demangle_strict(
     name: str,
     style: Style = "gcc",
     placeholders: bool = False,
+    min_placeholder_length: int = 0,
 ) -> str:
     """
     Demangle ``name`` or raise ``DemangleError``.
@@ -1849,6 +1922,10 @@ def demangle_strict(
         site, with each placeholder's spelling given in a legend appended after the main
         text as ``[$0 = ..., $1 = ...]``. This keeps output compact when the same
         (potentially long) type or name is referenced repeatedly.
+    :param min_placeholder_length: Minimum length, in characters, of a substitution's
+        rendered text before it is placeholderized; substitutions rendering shorter than
+        this are always inlined instead. Only relevant when ``placeholders`` is
+        ``True``.
     :return: Demangled name.
     :raises ValueError: If ``style`` is not recognized.
     :raises DemangleError: If the input is not a valid mangled name.
@@ -1858,38 +1935,58 @@ def demangle_strict(
         raise DemangleError(f"not an Itanium mangled name: {name!r}")
     core, suffix = m.group(1), m.group(2) or ""
     core = core[core.index("_Z") :]
-    result = Demangler(core, style=style, placeholders=placeholders).run()
+    result = Demangler(
+        core,
+        style=style,
+        placeholders=placeholders,
+        min_placeholder_length=min_placeholder_length,
+    ).run()
     if suffix:
         result += f" [clone {suffix}]"
     return result
 
 
-def demangle(name: str, style: Style = "gcc", placeholders: bool = False) -> str:
+def demangle(
+    name: str,
+    style: Style = "gcc",
+    placeholders: bool = False,
+    min_placeholder_length: int = 0,
+) -> str:
     """
     Demangle ``name`` or return it unchanged on failure.
 
     :param name: Mangled symbol.
     :param style: Output style, either ``"gcc"`` or ``"llvm"``.
     :param placeholders: See :func:`demangle_strict`.
+    :param min_placeholder_length: See :func:`demangle_strict`.
     :return: Demangled name or original input.
     """
     try:
-        return demangle_strict(name, style, placeholders)
+        return demangle_strict(name, style, placeholders, min_placeholder_length)
     except (DemangleError, RecursionError):
         return name
 
 
-def demangle_text(text: str, style: Style = "gcc", placeholders: bool = False) -> str:
+def demangle_text(
+    text: str,
+    style: Style = "gcc",
+    placeholders: bool = False,
+    min_placeholder_length: int = 0,
+) -> str:
     """
     Replace every mangled name in ``text`` with its demangled form.
 
     :param text: Input text.
     :param style: Output style, either ``"gcc"`` or ``"llvm"``.
     :param placeholders: See :func:`demangle_strict`.
+    :param min_placeholder_length: See :func:`demangle_strict`.
     :return: Text with demangled symbols.
     """
     return _SYMBOL_RE.sub(
-        lambda match: demangle(match.group(0), style, placeholders), text
+        lambda match: demangle(
+            match.group(0), style, placeholders, min_placeholder_length
+        ),
+        text,
     )
 
 
@@ -1990,6 +2087,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "placeholder's spelling given in a legend appended after the main text."
         ),
     )
+    parser.add_argument(
+        "--min-placeholder-length",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "With --placeholders, only replace a substitution with a placeholder "
+            "when its rendered text is at least N characters long; shorter "
+            "substitutions are always inlined. Default: 0 (placeholderize every "
+            "reused substitution)."
+        ),
+    )
     return parser
 
 
@@ -2024,7 +2133,14 @@ def run(argv: Iterable[str] | None = None) -> int:
             continue
         try:
             if "_Z" in name:
-                print(demangle_strict(name, args.style, args.placeholders))
+                print(
+                    demangle_strict(
+                        name,
+                        args.style,
+                        args.placeholders,
+                        args.min_placeholder_length,
+                    )
+                )
             elif args.strict:
                 raise DemangleError("no '_Z' prefix found")
             else:
@@ -2034,7 +2150,14 @@ def run(argv: Iterable[str] | None = None) -> int:
                 print(f"Error: {exc}", file=sys.stderr)
                 status = 1
             else:
-                print(demangle_text(name, args.style, args.placeholders))
+                print(
+                    demangle_text(
+                        name,
+                        args.style,
+                        args.placeholders,
+                        args.min_placeholder_length,
+                    )
+                )
     return status
 
 
