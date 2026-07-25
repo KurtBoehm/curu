@@ -830,6 +830,96 @@ class TestCloneSuffixes:
 
 
 # --------------------------------------------------------------------------------------
+# Generic lambdas: invented ("auto") call-operator parameters
+# --------------------------------------------------------------------------------------
+
+
+class TestGenericLambdaInventedParams:
+    """
+    Regression tests for a bug in how a generic lambda's invented (``auto``)
+    call-operator parameters were rendered when the closure type itself is spelled out
+    directly (Itanium ``Ul <params> E_``), rather than being named through an
+    instantiated ``operator()<Args...>`` call.
+
+    Such a ``T_``/``T0_`` reference used to render as the raw ``T_``-style spelling
+    (or, worse, resolve against whatever unrelated template-argument scope happened to
+    still be on the parser's stack from an enclosing class template, corrupting the
+    surrounding output). Both GNU ``c++filt`` and LLVM's demangler instead print these
+    as ``auto:1``, ``auto:2``, ... -- numbered by the parameter's 0-based index plus
+    one, independently for each closure. The fix pushes a fresh scope when entering
+    every lambda signature (whether or not it has an explicit template-parameter list)
+    so unresolved references there fall back to ``auto:N`` instead of leaking through
+    to an enclosing scope or the raw spelling.
+    """
+
+    def test_single_reference_parameter(self) -> None:
+        assert demangle_strict("_Z1fZ1gvEUlRT_E_") == "f(g()::{lambda(auto:1&)#1})"
+
+    def test_multiple_parameters_are_numbered_independently(self) -> None:
+        assert demangle_strict("_Z1fZ1gvEUlT_T0_E_") == (
+            "f(g()::{lambda(auto:1, auto:2)#1})"
+        )
+
+    def test_reference_and_value_parameters_are_numbered_by_position(self) -> None:
+        assert demangle_strict("_Z1fZ1gvEUlRT_T0_E_") == (
+            "f(g()::{lambda(auto:1&, auto:2)#1})"
+        )
+
+    def test_does_not_leak_into_an_enclosing_class_templates_scope(self) -> None:
+        """
+        Regression test for the more serious half of the bug: previously, a bare
+        ``T_`` inside a lambda's parameter list -- when the lambda itself had no
+        template-parameter declarations of its own -- resolved against whatever
+        template-argument scope was still on the parser's stack from an *enclosing*
+        class template, rather than being treated as unresolved. Real-world instances
+        of this (drawn from libstdc++'s ``std::variant`` internals) would silently
+        substitute in the wrong type and corrupt the surrounding declarator (e.g.
+        dropping a trailing ``&&``). Here, the outer class template's first argument
+        is ``bool``, which must not leak into the lambda's own ``auto:1``.
+        """
+        symbol = "_ZN1SIbEC1EZ1gvEUlRT_E_"
+        result = demangle_strict(symbol)
+        assert "auto:1&" in result
+        assert result == "S<bool>::S(g()::{lambda(auto:1&)#1})"
+
+
+# --------------------------------------------------------------------------------------
+# Inheriting constructors
+# --------------------------------------------------------------------------------------
+
+
+class TestInheritingConstructors:
+    """
+    Regression tests for Itanium's inheriting-constructor forms (``CI1``/``CI2``,
+    e.g. from a ``using Base::Base;`` declaration), which carry the inherited base
+    class's type right after the ctor-dtor-name. That base type used to be parsed and
+    then silently discarded, so the constructor was always rendered under the derived
+    class's own name.
+
+    GNU ``c++filt`` and LLVM's demangler disagree on the convention here: GNU names
+    the function after the *inherited base class*, while LLVM keeps the *derived*
+    class's own name. The fix threads the parsed base type through so ``style="gcc"``
+    can use it while ``style="llvm"`` keeps the previous (already-correct) behavior.
+    """
+
+    SYMBOL: str = "_ZN7DerivedCI14BaseEid"
+
+    def test_gcc_style_uses_the_inherited_base_class_name(self) -> None:
+        assert demangle_strict(self.SYMBOL, style="gcc") == "Derived::Base(int, double)"
+
+    def test_llvm_style_keeps_the_derived_class_name(self) -> None:
+        assert (
+            demangle_strict(self.SYMBOL, style="llvm")
+            == "Derived::Derived(int, double)"
+        )
+
+    def test_base_object_variant_behaves_the_same(self) -> None:
+        symbol = "_ZN7DerivedCI24BaseEid"
+        assert demangle_strict(symbol, style="gcc") == "Derived::Base(int, double)"
+        assert demangle_strict(symbol, style="llvm") == "Derived::Derived(int, double)"
+
+
+# --------------------------------------------------------------------------------------
 # Error handling
 # --------------------------------------------------------------------------------------
 

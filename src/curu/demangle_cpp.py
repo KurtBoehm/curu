@@ -417,6 +417,18 @@ class PackExpansion(Node):
         return _decl(f"{self.t.render(style=style)}...", inner)
 
 
+class AutoScope(list["Node"]):
+    """
+    A template-parameter scope belonging to a lambda’s invented (``auto``) call-operator
+    parameters.
+
+    Distinguishing this from an ordinary template-argument scope lets :class:`ParamRef`
+    render an index that has no explicit declaration entry (i.e. an implicitly deduced
+    generic-lambda parameter) as ``auto:N`` instead of falling back to the raw
+    ``T_``-style spelling, matching GNU/LLVM demangler output.
+    """
+
+
 @final
 class ParamRef(Node):
     """Template parameter reference."""
@@ -436,6 +448,8 @@ class ParamRef(Node):
     def render(self, inner: str = "", style: Style = "gcc") -> str:
         target = self.resolve()
         if target is None or self._busy:
+            if isinstance(self.scope, AutoScope):
+                return _decl(f"auto:{self.index + 1}", inner)
             return _decl(self.spelling, inner)
         self._busy = True
         try:
@@ -502,15 +516,30 @@ class LocalName(Node):
 
 @final
 class CtorDtor(Node):
-    """Constructor or destructor node."""
+    """
+    Constructor or destructor name.
 
-    def __init__(self, prefix: Node | None, is_dtor: bool) -> None:
+    ``inherited`` is set for an inheriting constructor (Itanium ``CI1``/``CI2``): GNU
+    ``c++filt`` names the function after the inherited base class, while LLVM’s
+    ``cxxfilt`` keeps the derived class’s own name.
+    """
+
+    def __init__(
+        self,
+        prefix: Node | None,
+        is_dtor: bool,
+        inherited: Node | None = None,
+    ) -> None:
         self.prefix = prefix
         self.is_dtor = is_dtor
+        self.inherited = inherited
 
     @override
     def render(self, inner: str = "", style: Style = "gcc") -> str:
-        base = self.prefix.base_name() if self.prefix is not None else ""
+        if self.inherited is not None and style == "gcc":
+            base = self.inherited.base_name()
+        else:
+            base = self.prefix.base_name() if self.prefix is not None else ""
         return _decl(f"{'~' if self.is_dtor else ''}{base}", inner)
 
 
@@ -1177,13 +1206,14 @@ class Demangler:
         """
         c = self.peek()
         self.advance()
+        inherited: Node | None = None
         if c == "C" and self.consume_if("I"):
             self.advance()
-            self.parse_type()
+            inherited = self.parse_type()
         else:
             self.advance()
         self.is_ctor_dtor = True
-        return CtorDtor(prefix, c == "D")
+        return CtorDtor(prefix, c == "D", inherited)
 
     def parse_operator_name(self) -> Node:
         """
@@ -1222,12 +1252,10 @@ class Demangler:
             self.expect("_")
             return self.add_sub(UnnamedT(int(digits) + 1 if digits else 1))
         if self.consume_if("l"):
-            saved: list[list[Node]] | None = None
-            if self.peek() == "T" and self.peek(1) in "ytnpk":
-                saved = list(self.tparams)
-                self.tparams.append([])
-                while self.peek() == "T" and self.peek(1) in "ytnpk":
-                    self.parse_template_param_decl()
+            saved = list(self.tparams)
+            self.tparams.append(AutoScope())
+            while self.peek() == "T" and self.peek(1) in "ytnpk":
+                self.parse_template_param_decl()
             params: list[Node] = []
             while not self.consume_if("E"):
                 if self.at_end():
@@ -1235,8 +1263,7 @@ class Demangler:
                 params.append(self.parse_type())
             digits = self.parse_digits()
             self.expect("_")
-            if saved is not None:
-                self.tparams = saved
+            self.tparams = saved
             if len(params) == 1 and self._render(params[0]) == "void":
                 params = []
             return self.add_sub(Lambda(params, int(digits) + 1 if digits else 1))
@@ -1843,7 +1870,7 @@ class Demangler:
             try:
                 data = bytes.fromhex(raw if len(raw) % 2 == 0 else f"0{raw}")
                 if type_name == "float" and len(data) == 4:
-                    return f"{repr(struct.unpack('>f', data)[0])}f"
+                    return f"{struct.unpack('>f', data)[0]!r}f"
                 if type_name == "double" and len(data) == 8:
                     return repr(struct.unpack(">d", data)[0])
             except (ValueError, struct.error):
